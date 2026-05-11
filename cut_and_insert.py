@@ -1,95 +1,167 @@
 import os
 import subprocess
 import re
+import argparse
+import sys
+import json
+
+try:
+    import yaml
+except ImportError:
+    print("Ошибка: Для работы скрипта нужна библиотека PyYAML.")
+    print("Пожалуйста, установите её командой: pip install pyyaml")
+    sys.exit(1)
 
 def parse_time(t_str):
-    # Заменяем точки на двоеточия: 00.05.36 -> 00:05:36
     return t_str.replace('.', ':').strip()
 
-def main():
-    # Названия файлов
-    main_video = "Наполеон_2023_WEB-DLRip-AVC.mkv"
-    timings_file = "timings.txt"
-    output_video = "output.mkv"
-    
-    if not os.path.exists(main_video):
-        print(f"Ошибка: Главный фильм '{main_video}' не найден в текущей папке.")
-        return
+def get_video_properties(video_path):
+    cmd = [
+        'ffprobe', '-v', 'error', '-show_streams', '-of', 'json', video_path
+    ]
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+        data = json.loads(result.stdout)
         
-    if not os.path.exists(timings_file):
-        print(f"Файл '{timings_file}' не найден. Создаю шаблон...")
-        with open(timings_file, "w", encoding='utf-8') as f:
-            f.write("00.00.00-00.05.36\n")
-            f.write("ad.mp4\n")
-            f.write("00.05.55-end\n")
-        print(f"Шаблон '{timings_file}' создан! Отредактируйте его и запустите скрипт снова.")
+        props = {}
+        for stream in data.get('streams', []):
+            if stream['codec_type'] == 'video' and 'width' not in props:
+                props['width'] = stream['width']
+                props['height'] = stream['height']
+                props['fps'] = stream.get('r_frame_rate', '24/1')
+            elif stream['codec_type'] == 'audio' and 'a_codec' not in props:
+                props['a_codec'] = stream.get('codec_name', 'aac')
+                props['a_sample_rate'] = stream.get('sample_rate', '48000')
+                props['a_channels'] = stream.get('channels', 2)
+        
+        # Если вдруг аудио вообще нет в фильме, зададим дефолт
+        if 'a_codec' not in props:
+            props['a_codec'] = 'aac'
+            props['a_sample_rate'] = '48000'
+            props['a_channels'] = 2
+            
+        return props
+    except Exception as e:
+        print(f"Ошибка при получении свойств видео {video_path}: {e}")
+    return None
+
+def normalize_ad(main_video_props, ad_file, output_file):
+    width = main_video_props['width']
+    height = main_video_props['height']
+    fps = main_video_props['fps']
+    
+    a_codec = main_video_props['a_codec']
+    # ffmpeg использует 'libmp3lame' для mp3
+    if a_codec == 'mp3':
+        a_codec = 'libmp3lame'
+        
+    a_sample_rate = main_video_props['a_sample_rate']
+    a_channels = main_video_props['a_channels']
+    
+    # Проверяем, есть ли звук в самой рекламе
+    has_audio = False
+    try:
+        cmd_a = ['ffprobe', '-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1', ad_file]
+        res = subprocess.run(cmd_a, stdout=subprocess.PIPE, text=True).stdout.strip()
+        if res:
+            has_audio = True
+    except:
+        pass
+
+    cmd = ['ffmpeg', '-y', '-i', ad_file]
+    
+    # Если звука нет, генерируем тишину, иначе concat вырежет звук из всего фильма!
+    if not has_audio:
+        cmd.extend(['-f', 'lavfi', '-i', f'anullsrc=r={a_sample_rate}:cl=stereo'])
+        
+    cmd.extend([
+        '-vf', f'scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1',
+        '-r', str(fps),
+        '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
+        '-c:a', a_codec,
+        '-ar', str(a_sample_rate),
+        '-ac', str(a_channels)
+    ])
+    
+    if not has_audio:
+        # Привязываем длину звука к длине видео
+        cmd.extend(['-shortest'])
+        # Указываем маппинг
+        cmd.extend(['-map', '0:v:0', '-map', '1:a:0'])
+
+    cmd.append(output_file)
+
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def process_job(job_name, main_video, sequence, job_index):
+    if not main_video or not os.path.exists(main_video):
+        print(f"[{job_name}] ❌ Ошибка: Главный фильм '{main_video}' не найден.")
         return
 
-    with open(timings_file, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
+    print(f"\n🎬 Начинаю сборку: {job_name}")
+    print(f"  🔍 Анализирую параметры фильма '{main_video}'...")
+    main_props = get_video_properties(main_video)
+    
+    if not main_props:
+        print(f"[{job_name}] ❌ Ошибка: Не удалось получить параметры фильма через ffprobe.")
+        return
 
     concat_list = []
     part_index = 0
+    ad_index = 0
     
-    print("Начинаю нарезку фильма...")
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-            
-        # Проверяем, является ли строка интервалом (например, 00.05.36-00.05.55 или 00:05:36-end)
-        match = re.match(r'^([\d\.:]+)\s*-\s*([\d\.:]+|end)$', line, re.IGNORECASE)
+    for item in sequence:
+        item_clean = re.sub(r'^(clip:\s*|-\s*)', '', str(item), flags=re.IGNORECASE).strip()
+        match = re.match(r'^([\d\.:]+)\s*-\s*([\d\.:]+|end)$', item_clean, re.IGNORECASE)
         
         if match:
             start_time = parse_time(match.group(1))
             end_time = match.group(2).lower()
             
-            part_name = f"temp_part_{part_index}.mkv"
-            print(f"⏳ Вырезаю фрагмент: {start_time} -> {end_time}...")
+            part_name = f"temp_{job_index}_part_{part_index}.mkv"
+            print(f"  ⏳ Вырезаю фрагмент фильма: {start_time} -> {end_time}...")
             
-            # Команда для ffmpeg (без перекодировки, -c copy)
             cmd = ['ffmpeg', '-y', '-i', main_video, '-ss', start_time]
             if end_time != 'end':
                 cmd.extend(['-to', parse_time(end_time)])
             cmd.extend(['-c', 'copy', part_name])
             
-            # Запускаем ffmpeg, подавляя весь вывод кроме ошибок
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
             concat_list.append(part_name)
             part_index += 1
         else:
-            # Если это не интервал, значит это путь к рекламному ролику
-            ad_file = line
+            ad_file = item_clean
             if os.path.exists(ad_file):
-                print(f"✅ Добавляю рекламный ролик в очередь: {ad_file}")
-                concat_list.append(ad_file)
+                normalized_ad_name = f"temp_{job_index}_ad_{ad_index}.mkv"
+                print(f"  ⚙️  Подгоняю ролик '{ad_file}' под формат фильма (Звук: {main_props['a_codec']}, {main_props['a_channels']}ch)...")
+                normalize_ad(main_props, ad_file, normalized_ad_name)
+                concat_list.append(normalized_ad_name)
+                ad_index += 1
             else:
-                print(f"⚠️ Внимание: Рекламный ролик '{ad_file}' не найден! Он будет пропущен.")
+                print(f"  ⚠️ Внимание: Ролик '{ad_file}' не найден! Пропускаю.")
 
     if not concat_list:
-        print("Не найдено фрагментов для склейки.")
+        print(f"[{job_name}] ❌ Не найдено валидных фрагментов для склейки.")
         return
 
-    # Создаем текстовый файл для ffmpeg concat demuxer
-    concat_file = "concat_list.txt"
+    concat_file = f"concat_list_{job_index}.txt"
     with open(concat_file, 'w', encoding='utf-8') as f:
         for item in concat_list:
             f.write(f"file '{item}'\n")
             
-    print("🔄 Склеиваю все части воедино (это займет немного времени)...")
+    print(f"  🔄 Склеиваю {job_name} (без перекодировки вырезанных фрагментов)...")
     concat_cmd = [
         'ffmpeg', '-y', '-f', 'concat', '-safe', '0', 
-        '-i', concat_file, '-c', 'copy', output_video
+        '-i', concat_file, '-c', 'copy', job_name
     ]
     subprocess.run(concat_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
-    print(f"🎉 Готово! Итоговый фильм сохранен как: {output_video}")
+    print(f"🎉 Готово: {job_name} сохранен!")
     
-    # Зачистка временных файлов
-    print("🧹 Удаляю временные файлы...")
+    # Зачистка
+    print(f"  🧹 Удаляю временные файлы для {job_name}...")
     for item in concat_list:
-        if item.startswith("temp_part_"):
+        if item.startswith(f"temp_{job_index}_"):
             try:
                 os.remove(item)
             except:
@@ -98,6 +170,34 @@ def main():
         os.remove(concat_file)
     except:
         pass
+
+def main():
+    parser = argparse.ArgumentParser(description="Скрипт для пакетной нарезки и склейки трейлеров (через YAML).")
+    parser.add_argument("-c", "--config", default="config.yaml", help="Путь к файлу конфигурации")
+    args = parser.parse_args()
+
+    config_file = args.config
+
+    if not os.path.exists(config_file):
+        print(f"Файл '{config_file}' не найден. Пожалуйста, создайте его.")
+        return
+
+    with open(config_file, 'r', encoding='utf-8') as f:
+        try:
+            jobs = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            print(f"Ошибка при чтении YAML файла: {e}")
+            return
+
+    if not isinstance(jobs, list):
+        print("Ошибка: YAML файл должен содержать массив (список) задач.")
+        return
+        
+    for job_index, job in enumerate(jobs):
+        job_name = job.get("output", f"output_{job_index}.mkv")
+        main_video = job.get("movie")
+        sequence = job.get("sequence", [])
+        process_job(job_name, main_video, sequence, job_index)
 
 if __name__ == "__main__":
     main()
