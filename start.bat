@@ -19,7 +19,7 @@ if %errorlevel% neq 0 (
 python -c "import yaml" >nul 2>&1
 if %errorlevel% neq 0 (
     echo [ИНФО] Библиотека PyYAML не найдена. Начинаю установку...
-    pip install pyyaml
+    python -m pip install pyyaml
 )
 
 :: Запуск скрипта
