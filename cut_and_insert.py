@@ -144,9 +144,9 @@ def process_job(job_name, main_video, sequence, job_index):
                 if duration <= 0:
                     print(f"  ⚠️ Неверный диапазон времени: {start_time} -> {end_time}. Пропускаю.")
                     continue
-                cmd = ['ffmpeg', '-y', '-ss', start_time, '-i', main_video, '-t', str(duration), '-c', 'copy', part_name]
+                cmd = ['ffmpeg', '-y', '-ss', start_time, '-fflags', '+genpts', '-i', main_video, '-t', str(duration), '-c', 'copy', part_name]
             else:
-                cmd = ['ffmpeg', '-y', '-ss', start_time, '-i', main_video, '-c', 'copy', part_name]
+                cmd = ['ffmpeg', '-y', '-ss', start_time, '-fflags', '+genpts', '-i', main_video, '-c', 'copy', part_name]
 
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             concat_list.append(part_name)
