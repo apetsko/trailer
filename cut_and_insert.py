@@ -15,6 +15,20 @@ except ImportError:
 def parse_time(t_str):
     return t_str.replace('.', ':').strip()
 
+def time_str_to_seconds(t_str):
+    s = str(t_str).strip()
+    s = s.replace(',', '.')
+    # Accept formats: HH:MM:SS(.ms), MM:SS(.ms), SS(.ms)
+    parts = s.split(':')
+    try:
+        parts = [float(p) for p in parts]
+    except:
+        return 0.0
+    if len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    if len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    return parts[0]
 def get_video_properties(video_path):
     cmd = [
         'ffprobe', '-v', 'error', '-show_streams', '-of', 'json', video_path
@@ -120,12 +134,20 @@ def process_job(job_name, main_video, sequence, job_index):
             
             part_name = f"temp_{job_index}_part_{part_index}.mkv"
             print(f"  ⏳ Вырезаю фрагмент фильма: {start_time} -> {end_time}...")
-            
-            cmd = ['ffmpeg', '-y', '-i', main_video, '-ss', start_time]
+
+            # Use -ss before -i for more reliable seeking on containers like AVI.
+            # When an end time is provided, compute duration and pass with -t.
             if end_time != 'end':
-                cmd.extend(['-to', parse_time(end_time)])
-            cmd.extend(['-c', 'copy', part_name])
-            
+                start_sec = time_str_to_seconds(start_time)
+                end_sec = time_str_to_seconds(parse_time(end_time))
+                duration = end_sec - start_sec
+                if duration <= 0:
+                    print(f"  ⚠️ Неверный диапазон времени: {start_time} -> {end_time}. Пропускаю.")
+                    continue
+                cmd = ['ffmpeg', '-y', '-ss', start_time, '-i', main_video, '-t', str(duration), '-c', 'copy', part_name]
+            else:
+                cmd = ['ffmpeg', '-y', '-ss', start_time, '-i', main_video, '-c', 'copy', part_name]
+
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             concat_list.append(part_name)
             part_index += 1
