@@ -4,6 +4,7 @@ import re
 import argparse
 import sys
 import json
+import hashlib
 
 try:
     import yaml
@@ -61,67 +62,68 @@ def get_video_properties(video_path):
         print(f"Ошибка при получении свойств видео {video_path}: {e}")
     return None
 
-def is_h264_compatible(props):
-    """Проверяет, совместим ли кодек фильма с H.264 для concat без перекодировки."""
-    v_codec = props.get('v_codec', '').lower()
-    a_codec = props.get('a_codec', '').lower()
-    # H.264 совместимые кодеки для concat
-    h264_ok = v_codec in ('h264', 'libx264')
-    # Аудио-кодеки, совместимые без перекодировки
-    audio_ok = a_codec in ('aac', 'mp3', 'ac3', 'eac3', 'opus', 'vorbis', 'flac')
-    return h264_ok and audio_ok
-
-def get_target_encoding_params(props):
-    """Возвращает параметры кодирования для единого формата."""
-    a_codec = props.get('a_codec', 'aac')
-    # ffmpeg использует 'libmp3lame' для mp3
-    if a_codec == 'mp3':
-        a_codec = 'libmp3lame'
-    return {
-        'width': props['width'],
-        'height': props['height'],
-        'fps': props['fps'],
-        'a_codec': a_codec,
-        'a_sample_rate': props.get('a_sample_rate', '48000'),
-        'a_channels': props.get('a_channels', 2),
+def get_ffmpeg_encoder(codec_name):
+    """Маппинг имён кодеков ffprobe -> имена энкодеров ffmpeg."""
+    mapping = {
+        'h264': 'libx264',
+        'hevc': 'libx265',
+        'h265': 'libx265',
+        'mpeg4': 'mpeg4',
+        'vp8': 'libvpx',
+        'vp9': 'libvpx-vp9',
+        'av1': 'libaom-av1',
     }
+    return mapping.get(codec_name.lower(), 'libx264')
 
-def encode_clip(main_video, start_time, duration_or_end, output_file, enc_params):
-    """Вырезает фрагмент фильма с перекодировкой в единый формат."""
-    width = enc_params['width']
-    height = enc_params['height']
-    fps = enc_params['fps']
-    a_codec = enc_params['a_codec']
-    a_sample_rate = enc_params['a_sample_rate']
-    a_channels = enc_params['a_channels']
+def get_ffmpeg_audio_encoder(codec_name):
+    """Маппинг имён аудио-кодеков ffprobe -> имена энкодеров ffmpeg."""
+    mapping = {
+        'mp3': 'libmp3lame',
+        'aac': 'aac',
+        'ac3': 'ac3',
+        'eac3': 'eac3',
+        'opus': 'libopus',
+        'vorbis': 'libvorbis',
+        'flac': 'flac',
+    }
+    return mapping.get(codec_name.lower(), 'aac')
 
-    cmd = ['ffmpeg', '-y', '-ss', start_time, '-fflags', '+genpts', '-i', main_video]
-    if duration_or_end is not None:
-        cmd.extend(['-t', str(duration_or_end)])
-    cmd.extend([
-        '-vf', f'scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1',
-        '-r', str(fps),
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
-        '-pix_fmt', 'yuv420p',
-        '-c:a', a_codec,
-        '-ar', str(a_sample_rate),
-        '-ac', str(a_channels),
-        output_file
-    ])
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def get_video_quality_args(encoder_name):
+    """Возвращает аргументы качества для конкретного видео-энкодера."""
+    if encoder_name == 'libx264':
+        return ['-preset', 'fast', '-crf', '22']
+    elif encoder_name == 'libx265':
+        return ['-preset', 'fast', '-crf', '28']
+    elif encoder_name == 'mpeg4':
+        return ['-q:v', '4']
+    elif encoder_name in ('libvpx', 'libvpx-vp9'):
+        return ['-crf', '30', '-b:v', '0']
+    elif encoder_name == 'libaom-av1':
+        return ['-crf', '30', '-b:v', '0']
+    else:
+        return ['-q:v', '4']
+
+def get_encoded_ad_path(ad_file, main_props):
+    """Генерирует путь к кэшированному перекодированному ролику в папке encoded/."""
+    ad_basename = os.path.splitext(os.path.basename(ad_file))[0]
+    # Формируем уникальный суффикс из параметров фильма
+    fmt_key = f"{main_props['width']}x{main_props['height']}_{main_props['v_codec']}_{main_props['a_codec']}_{main_props['a_channels']}ch_{main_props['a_sample_rate']}hz"
+    # Короткий хэш для уникальности (на случай длинных имён)
+    fmt_hash = hashlib.md5(fmt_key.encode()).hexdigest()[:8]
+    return os.path.join('encoded', f"{ad_basename}_{fmt_hash}.mkv")
 
 def normalize_ad(main_video_props, ad_file, output_file):
+    """Перекодирует рекламный ролик в формат основного фильма."""
     width = main_video_props['width']
     height = main_video_props['height']
     fps = main_video_props['fps']
+    pix_fmt = main_video_props.get('pix_fmt', 'yuv420p')
     
-    a_codec = main_video_props['a_codec']
-    # ffmpeg использует 'libmp3lame' для mp3
-    if a_codec == 'mp3':
-        a_codec = 'libmp3lame'
-        
+    v_encoder = get_ffmpeg_encoder(main_video_props['v_codec'])
+    a_encoder = get_ffmpeg_audio_encoder(main_video_props['a_codec'])
     a_sample_rate = main_video_props['a_sample_rate']
     a_channels = main_video_props['a_channels']
+    quality_args = get_video_quality_args(v_encoder)
     
     # Проверяем, есть ли звук в самой рекламе
     has_audio = False
@@ -142,8 +144,12 @@ def normalize_ad(main_video_props, ad_file, output_file):
     cmd.extend([
         '-vf', f'scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1',
         '-r', str(fps),
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
-        '-c:a', a_codec,
+        '-c:v', v_encoder,
+    ])
+    cmd.extend(quality_args)
+    cmd.extend([
+        '-pix_fmt', pix_fmt,
+        '-c:a', a_encoder,
         '-ar', str(a_sample_rate),
         '-ac', str(a_channels)
     ])
@@ -171,20 +177,16 @@ def process_job(job_name, main_video, sequence, job_index):
         print(f"[{job_name}] ❌ Ошибка: Не удалось получить параметры фильма через ffprobe.")
         return
 
-    # Определяем, нужна ли перекодировка фрагментов фильма
-    use_copy = is_h264_compatible(main_props)
-    enc_params = get_target_encoding_params(main_props)
-    
-    if use_copy:
-        print(f"  ✅ Фильм уже в H.264 + {main_props['a_codec']} — фрагменты будут вырезаны без перекодировки")
-    else:
-        print(f"  🔄 Фильм в формате {main_props['v_codec']}/{main_props['a_codec']} — фрагменты будут перекодированы в H.264")
+    v_encoder = get_ffmpeg_encoder(main_props['v_codec'])
+    print(f"  📋 Формат фильма: {main_props['v_codec']}/{main_props['a_codec']}, {main_props['width']}x{main_props['height']}")
+    print(f"  📋 Фрагменты фильма: -c copy | Вставки будут перекодированы в: {v_encoder}/{main_props['a_codec']}")
+
+    # Создаём папку для кэша перекодированных роликов
+    os.makedirs('encoded', exist_ok=True)
 
     concat_list = []
     part_index = 0
-    ad_index = 0
-    ad_cache = {}  # кэш: абсолютный путь исходника -> путь к нормализованному файлу
-    temp_files = []  # список всех temp-файлов для очистки
+    temp_files = []  # только temp-файлы фрагментов фильма (будут удалены)
     
     for item in sequence:
         item_clean = re.sub(r'^(clip:\s*|-\s*)', '', str(item), flags=re.IGNORECASE).strip()
@@ -206,18 +208,13 @@ def process_job(job_name, main_video, sequence, job_index):
             else:
                 duration = None  # до конца файла
 
-            if use_copy:
-                # Фильм уже H.264 — быстрая вырезка без перекодировки
-                print(f"  ⏳ Вырезаю фрагмент фильма (copy): {start_time} -> {end_time}...")
-                cmd = ['ffmpeg', '-y', '-ss', start_time, '-fflags', '+genpts', '-i', main_video]
-                if duration is not None:
-                    cmd.extend(['-t', str(duration)])
-                cmd.extend(['-c', 'copy', part_name])
-                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:
-                # Фильм в другом формате — перекодируем фрагмент в H.264
-                print(f"  ⏳ Вырезаю и перекодирую фрагмент фильма: {start_time} -> {end_time}...")
-                encode_clip(main_video, start_time, duration, part_name, enc_params)
+            # Фрагменты фильма всегда вырезаются без перекодировки
+            print(f"  ⏳ Вырезаю фрагмент фильма (copy): {start_time} -> {end_time}...")
+            cmd = ['ffmpeg', '-y', '-ss', start_time, '-fflags', '+genpts', '-i', main_video]
+            if duration is not None:
+                cmd.extend(['-t', str(duration)])
+            cmd.extend(['-c', 'copy', part_name])
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             concat_list.append(part_name)
             temp_files.append(part_name)
@@ -225,22 +222,19 @@ def process_job(job_name, main_video, sequence, job_index):
         else:
             ad_file = item_clean
             if os.path.exists(ad_file):
-                ad_abs_path = os.path.abspath(ad_file)
+                # Проверяем, есть ли уже перекодированная версия в encoded/
+                encoded_path = get_encoded_ad_path(ad_file, main_props)
                 
-                if ad_abs_path in ad_cache:
-                    # Уже перекодировали этот ролик — используем кэш
-                    cached_name = ad_cache[ad_abs_path]
-                    print(f"  ♻️  Ролик '{ad_file}' уже подготовлен, использую кэш: {cached_name}")
-                    concat_list.append(cached_name)
+                if os.path.exists(encoded_path):
+                    # Уже есть готовый файл — переиспользуем
+                    print(f"  ♻️  Ролик '{ad_file}' уже перекодирован, беру из кэша: {encoded_path}")
+                    concat_list.append(encoded_path)
                 else:
-                    # Первый раз встречаем — перекодируем
-                    normalized_ad_name = f"temp_{job_index}_ad_{ad_index}.mkv"
-                    print(f"  ⚙️  Подгоняю ролик '{ad_file}' под формат фильма (Звук: {main_props['a_codec']}, {main_props['a_channels']}ch)...")
-                    normalize_ad(main_props, ad_file, normalized_ad_name)
-                    ad_cache[ad_abs_path] = normalized_ad_name
-                    concat_list.append(normalized_ad_name)
-                    temp_files.append(normalized_ad_name)
-                    ad_index += 1
+                    # Перекодируем и сохраняем в encoded/
+                    print(f"  ⚙️  Подгоняю ролик '{ad_file}' под формат фильма ({main_props['v_codec']}/{main_props['a_codec']}, {main_props['a_channels']}ch)...")
+                    normalize_ad(main_props, ad_file, encoded_path)
+                    print(f"  💾 Сохранён в кэш: {encoded_path}")
+                    concat_list.append(encoded_path)
             else:
                 print(f"  ⚠️ Внимание: Ролик '{ad_file}' не найден! Пропускаю.")
 
@@ -262,7 +256,7 @@ def process_job(job_name, main_video, sequence, job_index):
     
     print(f"🎉 Готово: {job_name} сохранен!")
     
-    # Зачистка
+    # Зачистка — удаляем только temp-фрагменты фильма, перекодированные ролики остаются в encoded/
     print(f"  🧹 Удаляю временные файлы для {job_name}...")
     for item in temp_files:
         try:
