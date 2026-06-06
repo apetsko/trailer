@@ -169,6 +169,10 @@ def process_job(job_name, main_video, sequence, job_index):
         print(f"[{job_name}] ❌ Ошибка: Главный фильм '{main_video}' не найден.")
         return
 
+    output_dir = os.path.dirname(job_name)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
     print(f"\n🎬 Начинаю сборку: {job_name}")
     print(f"  🔍 Анализирую параметры фильма '{main_video}'...")
     main_props = get_video_properties(main_video)
