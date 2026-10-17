@@ -1,5 +1,11 @@
 *.mp4
 *.jpg
 *.mkv
+*.avi
 .DS_Store
 ffmpeg*
+__pycache__/
+encoded/
+.tmp_job_*/
+temp_*
+concat_list_*

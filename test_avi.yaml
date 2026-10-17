@@ -1,8 +1,8 @@
 - output: test_avi_result.mkv
-  movie: /Volumes/531A/videos/Рождение легенд_2023_HDRip.avi
+  movie: /Users/mx/projects/Vovchik/trailer/Наполеон_2023_WEB-DLRip-AVC.mkv
   sequence:
     - 00.05.00-00.05.10
-    - 2026-05-11 16.25.56.mp4
+    - 1.mp4
     - 00.10.00-00.10.10
-    - 2026-05-11 16.25.56.mp4
+    - 2.mp4
     - 00.15.00-00.15.10
